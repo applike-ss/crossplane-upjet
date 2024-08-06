@@ -6,13 +6,14 @@ package tfjson
 
 import (
 	tfjson "github.com/hashicorp/terraform-json"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	schemav2 "github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/pkg/errors"
 	"github.com/zclconf/go-cty/cty"
 )
 
-// GetV2ResourceMap converts input resource schemas with
-// "terraform-json" representation to terraform-plugin-sdk representation which
+// GetPluginFrameworkV1ResourceMap converts input resource schemas with
+// "terraform-json" representation to terraform-plugin-framework representation which
 // is what Upjet expects today.
 //
 // What we are trying to achieve here is to convert a lower level
@@ -25,24 +26,27 @@ import (
 // there exactly for this purpose, an external representation of Terraform
 // schemas. This conversion aims to be an intermediate step for that ultimate
 // goal.
-func GetV2ResourceMap(resourceSchemas map[string]*tfjson.Schema) map[string]*schemav2.Resource {
-	v2map := make(map[string]*schemav2.Resource, len(resourceSchemas))
+func GetPluginFrameworkV1ResourceMap(resourceSchemas map[string]*tfjson.Schema) map[string]*schema.Schema {
+	v2map := make(map[string]*schema.Schema, len(resourceSchemas))
 	for k, v := range resourceSchemas {
-		v2map[k] = v2ResourceFromTFJSONSchema(v)
+		v2map[k] = v1FrameworkResourceFromTFJSONSchema(v)
 	}
 	return v2map
 }
 
-func v2ResourceFromTFJSONSchema(s *tfjson.Schema) *schemav2.Resource {
-	v2Res := &schemav2.Resource{SchemaVersion: int(s.Version)}
+func v1FrameworkResourceFromTFJSONSchema(s *tfjson.Schema) *schema.Schema {
+	// TODO: technically we need to validate that s.Version is not greater INT64MAX,
+	//       however it is quite unlikely
+	v1Schema := &schema.Schema{Version: int64(s.Version)}
 	if s.Block == nil {
-		return v2Res
+		return v1Schema
 	}
 
-	toSchemaMap := make(map[string]*schemav2.Schema, len(s.Block.Attributes)+len(s.Block.NestedBlocks))
+	attributes := map[string]schema.Attribute{}
+	blocks := map[string]schema.Block{}
 
 	for k, v := range s.Block.Attributes {
-		toSchemaMap[k] = tfJSONAttributeToV2Schema(v)
+		attributes[k] = tfJSONAttributeToV1FrameworkSchema(v)
 	}
 	for k, v := range s.Block.NestedBlocks {
 		// CRUD timeouts are not part of the generated MR API,
@@ -52,17 +56,26 @@ func v2ResourceFromTFJSONSchema(s *tfjson.Schema) *schemav2.Resource {
 		if k == schemav2.TimeoutsConfigKey {
 			continue
 		}
-		toSchemaMap[k] = tfJSONBlockTypeToV2Schema(v)
+		blocks[k] = tfJSONBlockTypeToV1FrameworkSchema(v)
 	}
 
-	v2Res.Schema = toSchemaMap
-	v2Res.Description = s.Block.Description
-	v2Res.DeprecationMessage = deprecatedMessage(s.Block.Deprecated)
-	return v2Res
+	v1Schema.Attributes = attributes
+	v1Schema.Blocks = blocks
+	v1Schema.Description = s.Block.Description
+	v1Schema.DeprecationMessage = deprecatedMessage(s.Block.Deprecated)
+	return v1Schema
 }
 
-func tfJSONAttributeToV2Schema(attr *tfjson.SchemaAttribute) *schemav2.Schema {
-	v2sch := &schemav2.Schema{
+func tfJSONAttributeToV1FrameworkSchema(attr *tfjson.SchemaAttribute) schema.Attribute {
+	if attr.AttributeType != cty.NilType {
+		return tfJSONAttributeToV1FrameworkSchemaAttribute(attr)
+	}
+
+	return tfJSONAttributeToV1FrameworkSchemaAttributeNested(attr)
+}
+
+func tfJSONAttributeToV1FrameworkSchemaAttribute(attr *tfjson.SchemaAttribute) schema.Attribute {
+	v2sch := &schema.Attribute{
 		Optional:    attr.Optional,
 		Required:    attr.Required,
 		Description: attr.Description,
@@ -73,11 +86,29 @@ func tfJSONAttributeToV2Schema(attr *tfjson.SchemaAttribute) *schemav2.Schema {
 	if err := schemaV2TypeFromCtyType(attr.AttributeType, v2sch); err != nil {
 		panic(err)
 	}
+
 	return v2sch
 }
 
-func tfJSONBlockTypeToV2Schema(nb *tfjson.SchemaBlockType) *schemav2.Schema { //nolint:gocyclo
-	v2sch := &schemav2.Schema{
+func tfJSONAttributeToV1FrameworkSchemaAttributeNested(attr *tfjson.SchemaAttribute) schema.Attribute {
+	v2sch := &schema.Attribute{
+		Optional:    attr.Optional,
+		Required:    attr.Required,
+		Description: attr.Description,
+		Computed:    attr.Computed,
+		Deprecated:  deprecatedMessage(attr.Deprecated),
+		Sensitive:   attr.Sensitive,
+	}
+	if err := schemaV2TypeFromCtyType(attr.AttributeType, v2sch); err != nil {
+		panic(err)
+	}
+
+	return v2sch
+}
+
+func tfJSONBlockTypeToV1FrameworkSchema(nb *tfjson.SchemaBlockType) schema.Block { //nolint:gocyclo
+	// check form type which block type we need to create and return it
+	v2sch := schema.Block{
 		MinItems: int(nb.MinItems),
 		MaxItems: int(nb.MaxItems),
 	}
@@ -121,10 +152,11 @@ func tfJSONBlockTypeToV2Schema(nb *tfjson.SchemaBlockType) *schemav2.Schema { //
 	v2sch.Description = nb.Block.Description
 	v2sch.Deprecated = deprecatedMessage(nb.Block.Deprecated)
 
-	res := &schemav2.Resource{}
-	res.Schema = make(map[string]*schemav2.Schema, len(nb.Block.Attributes)+len(nb.Block.NestedBlocks))
+	res := &schema.Schema{}
+	res.Attributes = map[string]schema.Attribute{}
+	res.Blocks = map[string]schema.Block{}
 	for key, attr := range nb.Block.Attributes {
-		res.Schema[key] = tfJSONAttributeToV2Schema(attr)
+		res.Attributes[key] = tfJSONAttributeToV1FrameworkSchema(attr)
 	}
 	for key, block := range nb.Block.NestedBlocks {
 		// Please note that unlike the resource-level CRUD timeout configuration
@@ -132,7 +164,7 @@ func tfJSONBlockTypeToV2Schema(nb *tfjson.SchemaBlockType) *schemav2.Schema { //
 		// for any nested configuration blocks, *if they exist*.
 		// We can prevent them here, but they are different than the resource's
 		// top-level CRUD timeouts, so we have opted to generate them.
-		res.Schema[key] = tfJSONBlockTypeToV2Schema(block)
+		res.Blocks[key] = tfJSONBlockTypeToV1FrameworkSchema(block)
 	}
 	v2sch.Elem = res
 	return v2sch

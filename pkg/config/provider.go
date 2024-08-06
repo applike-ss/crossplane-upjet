@@ -299,7 +299,7 @@ func NewProvider(schema []byte, prefix string, modulePath string, metadata []byt
 		rs = v.ResourceSchemas
 		break
 	}
-	resourceMap := conversiontfjson.GetV2ResourceMap(rs)
+	resourceMap := conversiontfjson.GetPluginFrameworkV1ResourceMap(rs)
 	providerMetadata, err := registry.NewProviderMetadataFromFile(metadata)
 	if err != nil {
 		panic(errors.Wrap(err, "cannot load provider metadata"))
